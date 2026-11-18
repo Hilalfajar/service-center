@@ -81,12 +81,23 @@ class DetectTests(unittest.TestCase):
             root = Path(tmp)
             (root / "venv" / "bin").mkdir(parents=True)
             venv_python = root / "venv" / "bin" / "python"
-            venv_python.write_text("#!/bin/sh\n")
+            venv_python.write_bytes(b"\x7fELF\x02\x01\x01\x00")
             app = root / "app.py"
             app.write_text("print('hi')\n")
             command, workdir = backend.detect_command(app)
             self.assertEqual(command, [str(venv_python), str(app)])
             self.assertEqual(workdir, root)
+
+    def test_broken_venv_python_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "venv" / "bin").mkdir(parents=True)
+            (root / "venv" / "bin" / "python").write_text("Intx")
+            app = root / "app.py"
+            app.write_text("print('hi')\n")
+            command, _workdir = backend.detect_command(app)
+            self.assertNotEqual(command[0], str(root / "venv" / "bin" / "python"))
+            self.assertTrue(command[0].endswith("python3"))
 
     def test_package_json_start(self):
         with tempfile.TemporaryDirectory() as tmp:

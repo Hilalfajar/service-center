@@ -24,9 +24,15 @@ from backend import (  # noqa: E402
     linger_enabled,
     pretty_name,
 )
+from db_restore import (  # noqa: E402
+    ENGINE_LABELS,
+    RestoreError,
+    RestoreRequest,
+    restore as restore_database,
+)
 
 APP_NAME = "Service Center"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 CSS = b"""
 .dot-ok { color: #2ec27e; }
@@ -230,7 +236,6 @@ class MainWindow(Adw.ApplicationWindow):
         header = Adw.HeaderBar()
         header.set_title_widget(Adw.WindowTitle(title="Detail layanan"))
         header.set_show_start_title_buttons(False)
-        header.set_show_end_title_buttons(False)
         toolbar.add_top_bar(header)
 
         self.detail_stack = Gtk.Stack()
@@ -294,6 +299,19 @@ class MainWindow(Adw.ApplicationWindow):
             row.set_subtitle_selectable(True)
             info_group.add(row)
         page.add(info_group)
+
+        database_group = Adw.PreferencesGroup(title="Database")
+        restore_row = Adw.ActionRow(
+            title="Restore database",
+            subtitle="Pulihkan dump PostgreSQL ke database aplikasi",
+        )
+        restore_button = Gtk.Button(label="Restore")
+        restore_button.set_valign(Gtk.Align.CENTER)
+        restore_button.connect("clicked", self._on_restore_clicked)
+        restore_row.add_suffix(restore_button)
+        restore_row.set_activatable_widget(restore_button)
+        database_group.add(restore_row)
+        page.add(database_group)
 
         logs_group = Adw.PreferencesGroup(title="Log")
         self.logs_expander = Adw.ExpanderRow(title="Log layanan", subtitle="journalctl --user")
@@ -537,6 +555,20 @@ class MainWindow(Adw.ApplicationWindow):
             return
         self.logs_view.get_buffer().set_text(text if text.strip() else "Belum ada log.")
 
+    def _on_restore_clicked(self, _button) -> None:
+        service = self.manager.get(self.current_id or "")
+        if service is None:
+            return
+        RestoreDatabaseDialog(self, service).present(self)
+
+    def after_restore(self, success: bool, message: str) -> None:
+        self.refresh()
+        if success:
+            self._toast("Restore database selesai")
+        else:
+            first = message.strip().splitlines()[0] if message.strip() else "Restore gagal"
+            self._toast(f"Restore database gagal: {first}"[:180])
+
     def _on_delete_clicked(self, _button) -> None:
         service = self.manager.get(self.current_id or "")
         if service is None:
@@ -600,6 +632,287 @@ class MainWindow(Adw.ApplicationWindow):
 
     def _toast(self, message: str) -> None:
         self.toast_overlay.add_toast(Adw.Toast(title=message, timeout=3))
+
+
+class RestoreDatabaseDialog(Adw.Dialog):
+    def __init__(self, window: MainWindow, service) -> None:
+        super().__init__()
+        self.window = window
+        self.manager = window.manager
+        self.service = service
+        self.dump_path: Path | None = None
+        self.running = False
+        self.form_widgets: list[Gtk.Widget] = []
+
+        self.set_content_width(640)
+        self.set_content_height(780)
+        self.set_title("Restore Database")
+
+        toolbar = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.set_title_widget(
+            Adw.WindowTitle(title="Restore Database", subtitle=service.name)
+        )
+        self.close_button = Gtk.Button(label="Tutup")
+        self.close_button.connect("clicked", lambda *_: self.close())
+        header.pack_start(self.close_button)
+        self.start_button = Gtk.Button(label="Start")
+        self.start_button.add_css_class("suggested-action")
+        self.start_button.connect("clicked", self._on_start)
+        header.pack_end(self.start_button)
+        toolbar.add_top_bar(header)
+        self.set_child(toolbar)
+
+        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.error_banner = Adw.Banner(title="")
+        self.error_banner.set_revealed(False)
+        body.append(self.error_banner)
+        page = Adw.PreferencesPage()
+        body.append(page)
+        toolbar.set_content(body)
+
+        database_group = Adw.PreferencesGroup(
+            title="Database",
+            description="Saat ini mendukung PostgreSQL.",
+        )
+        self.engine_row = Adw.ComboRow(title="Jenis database")
+        self.engine_row.set_model(Gtk.StringList.new(list(ENGINE_LABELS.values())))
+        self.engine_row.set_selected(0)
+        database_group.add(self.engine_row)
+        self.form_widgets.append(self.engine_row)
+
+        self.host_row = Adw.EntryRow(title="Host")
+        self.host_row.set_text("localhost")
+        self.port_row = Adw.EntryRow(title="Port")
+        self.port_row.set_text("5432")
+        self.user_row = Adw.EntryRow(title="User")
+        self.user_row.set_text("postgres")
+        self.password_row = Adw.ActionRow(title="Password")
+        self.password_entry = Gtk.PasswordEntry()
+        self.password_entry.set_show_peek_icon(True)
+        self.password_entry.set_hexpand(True)
+        self.password_entry.set_size_request(260, -1)
+        self.password_row.add_suffix(self.password_entry)
+        self.database_row = Adw.EntryRow(title="Nama database")
+        for widget in (
+            self.host_row,
+            self.port_row,
+            self.user_row,
+            self.password_row,
+            self.database_row,
+        ):
+            database_group.add(widget)
+            self.form_widgets.append(widget)
+        page.add(database_group)
+
+        file_group = Adw.PreferencesGroup(title="File dump")
+        self.file_row = Adw.ActionRow(title="File", subtitle="Belum dipilih")
+        self.choose_button = Gtk.Button(label="Pilih File…")
+        self.choose_button.set_valign(Gtk.Align.CENTER)
+        self.choose_button.connect("clicked", self._choose_dump)
+        self.file_row.add_suffix(self.choose_button)
+        self.file_row.set_activatable_widget(self.choose_button)
+        file_group.add(self.file_row)
+        self.form_widgets.append(self.file_row)
+        page.add(file_group)
+
+        option_group = Adw.PreferencesGroup(title="Opsi")
+        self.create_row = Adw.SwitchRow(
+            title="Buat database jika belum ada",
+            active=True,
+        )
+        self.clean_row = Adw.SwitchRow(
+            title="Kosongkan objek lama",
+            subtitle="Hapus skema public sebelum restore",
+            active=False,
+        )
+        self.stop_row = Adw.SwitchRow(
+            title="Hentikan layanan saat restore",
+            subtitle="Layanan dinyalakan lagi setelah restore selesai",
+            active=True,
+        )
+        for row in (self.create_row, self.clean_row, self.stop_row):
+            option_group.add(row)
+            self.form_widgets.append(row)
+        page.add(option_group)
+
+        log_group = Adw.PreferencesGroup(title="Log")
+        self.log_expander = Adw.ExpanderRow(title="Log restore", subtitle="Keluaran psql")
+        self.log_expander.set_expanded(True)
+        log_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=6,
+            margin_top=6,
+            margin_bottom=6,
+            margin_start=6,
+            margin_end=6,
+        )
+        self.status_label = Gtk.Label(label="Siap", xalign=0)
+        self.status_label.set_wrap(True)
+        self.status_label.add_css_class("dim-label")
+        log_box.append(self.status_label)
+
+        self.log_view = Gtk.TextView()
+        self.log_view.set_editable(False)
+        self.log_view.set_cursor_visible(False)
+        self.log_view.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        self.log_view.set_left_margin(8)
+        self.log_view.set_right_margin(8)
+        self.log_view.set_top_margin(6)
+        self.log_view.set_bottom_margin(6)
+        self.log_view.add_css_class("logs-view")
+
+        log_scroller = Gtk.ScrolledWindow()
+        log_scroller.set_min_content_height(220)
+        log_scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        log_scroller.set_child(self.log_view)
+        log_box.append(log_scroller)
+
+        self.log_expander.add_row(log_box)
+        log_group.add(self.log_expander)
+        page.add(log_group)
+
+    def _choose_dump(self, _button) -> None:
+        dialog = Gtk.FileDialog()
+        dialog.set_title("Pilih file dump")
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        dump_filter = Gtk.FileFilter()
+        dump_filter.set_name("Dump database (*.sql, *.dump, *.backup, *.tar)")
+        for pattern in ("*.sql", "*.dump", "*.backup", "*.tar"):
+            dump_filter.add_pattern(pattern)
+        filters.append(dump_filter)
+        all_filter = Gtk.FileFilter()
+        all_filter.set_name("Semua file")
+        all_filter.add_pattern("*")
+        filters.append(all_filter)
+        dialog.set_filters(filters)
+        dialog.set_default_filter(dump_filter)
+        dialog.open(self.window, None, self._on_dump_chosen)
+
+    def _on_dump_chosen(self, dialog: Gtk.FileDialog, result) -> None:
+        try:
+            gfile = dialog.open_finish(result)
+        except GLib.Error:
+            return
+        if gfile is None or gfile.get_path() is None:
+            return
+        self.dump_path = Path(gfile.get_path())
+        self.file_row.set_subtitle(str(self.dump_path))
+        self.error_banner.set_revealed(False)
+
+    def _service_running(self) -> bool:
+        try:
+            states = self.manager.states([self.service.unit_name])
+        except RuntimeError:
+            return False
+        state = states.get(self.service.unit_name)
+        return bool(state and state.running)
+
+    def _on_start(self, _button) -> None:
+        if self.running:
+            return
+        self.error_banner.set_revealed(False)
+        if self.dump_path is None:
+            self._show_error("Pilih file dump dulu.")
+            return
+        engines = list(ENGINE_LABELS)
+        selected = self.engine_row.get_selected()
+        engine = engines[selected] if 0 <= selected < len(engines) else engines[0]
+        try:
+            request = RestoreRequest(
+                engine=engine,
+                host=self.host_row.get_text().strip(),
+                port=self.port_row.get_text().strip(),
+                user=self.user_row.get_text().strip(),
+                password=self.password_entry.get_text(),
+                database=self.database_row.get_text().strip(),
+                dump=self.dump_path,
+                create_database=self.create_row.get_active(),
+                clean=self.clean_row.get_active(),
+            )
+            request.validate()
+        except RestoreError as exc:
+            self._show_error(str(exc))
+            return
+
+        self._clear_log()
+        self._append_log(
+            f"Target: {request.user}@{request.host}:{request.port}/{request.database}"
+        )
+        self._append_log(f"File: {request.dump}")
+        self._status("Berjalan…")
+        self.running = True
+        self._set_running(True)
+        self.log_expander.set_expanded(True)
+        self.log_view.grab_focus()
+        was_running = self._service_running()
+        stop_service = self.stop_row.get_active()
+        threading.Thread(
+            target=self._restore_worker,
+            args=(request, was_running, stop_service),
+            daemon=True,
+        ).start()
+
+    def _restore_worker(self, request, was_running: bool, stop_service: bool) -> None:
+        success = False
+        error = ""
+        stopped = False
+        try:
+            if stop_service and was_running:
+                self._log(f"Menghentikan layanan {self.service.name}")
+                ok, message = self.manager.stop(self.service.id)
+                if not ok:
+                    raise RestoreError(f"Gagal menghentikan layanan: {message}")
+                stopped = True
+            restore_database(request, self._log)
+            success = True
+        except Exception as exc:  # noqa: BLE001
+            error = str(exc)
+        finally:
+            if stopped:
+                self._log(f"Menyalakan kembali layanan {self.service.name}")
+                ok, message = self.manager.start(self.service.id)
+                if not ok:
+                    self._log(f"Gagal menyalakan layanan: {message}")
+        GLib.idle_add(self._on_finished, success, error)
+
+    def _on_finished(self, success: bool, message: str) -> None:
+        self.running = False
+        self._set_running(False)
+        if success:
+            self._status("Restore selesai")
+        else:
+            self._status(f"Gagal: {message}")
+            self._append_log(f"Gagal: {message}")
+        self.window.after_restore(success, message)
+
+    def _set_running(self, running: bool) -> None:
+        for widget in self.form_widgets:
+            widget.set_sensitive(not running)
+        self.start_button.set_sensitive(not running)
+        self.close_button.set_sensitive(not running)
+        if hasattr(self, "set_can_close"):
+            self.set_can_close(not running)
+
+    def _show_error(self, message: str) -> None:
+        self.error_banner.set_title(message)
+        self.error_banner.set_revealed(True)
+
+    def _status(self, text: str) -> None:
+        self.status_label.set_text(text)
+
+    def _clear_log(self) -> None:
+        self.log_view.get_buffer().set_text("")
+
+    def _append_log(self, text: str) -> None:
+        buffer = self.log_view.get_buffer()
+        if buffer.get_end_iter().get_offset():
+            buffer.insert(buffer.get_end_iter(), "\n")
+        buffer.insert(buffer.get_end_iter(), text)
+        self.log_view.scroll_to_iter(buffer.get_end_iter(), 0.0, False, 0.0, 0.0)
+
+    def _log(self, text: str) -> None:
+        GLib.idle_add(self._append_log, text)
 
 
 class AddServiceDialog(Adw.Dialog):

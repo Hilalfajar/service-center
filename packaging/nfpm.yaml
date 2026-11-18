@@ -1,0 +1,57 @@
+name: service-center
+arch: amd64
+platform: linux
+version: 1.1.0
+release: 1
+section: utils
+priority: optional
+rpm:
+  arch: x86_64
+deb:
+  arch: amd64
+maintainer: Hilalfajar <hilalfajar@users.noreply.github.com>
+description: |
+  GUI GTK4/libadwaita untuk mendaftarkan file program sebagai layanan systemd user.
+  Fitur: daftar layanan, start/stop/restart, autostart, log journalctl, dan restore
+  database PostgreSQL langsung dari halaman detail layanan.
+vendor: Hilalfajar
+homepage: https://github.com/Hilalfajar/service-center
+license: Unspecified
+contents:
+  - src: build/stage/usr/bin/service-center
+    dst: /usr/bin/service-center
+    file_info:
+      mode: 0755
+  - src: build/stage/usr/lib/service-center
+    dst: /usr/lib/service-center
+  - src: build/stage/usr/share/applications/io.github.hilalfajar.ServiceCenter.desktop
+    dst: /usr/share/applications/io.github.hilalfajar.ServiceCenter.desktop
+    file_info:
+      mode: 0644
+  - src: build/stage/usr/share/icons/hicolor/scalable/apps/service-center.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/service-center.svg
+    file_info:
+      mode: 0644
+  - src: build/stage/usr/share/doc/service-center/README.md
+    dst: /usr/share/doc/service-center/README.md
+    file_info:
+      mode: 0644
+scripts:
+  postinstall: packaging/postinstall.sh
+  postremove: packaging/postremove.sh
+overrides:
+  rpm:
+    depends:
+      - python3-gobject
+      - gtk4
+      - libadwaita
+      - systemd
+      - polkit
+  deb:
+    depends:
+      - python3 (>= 3.10)
+      - python3-gi
+      - gir1.2-gtk-4.0
+      - gir1.2-adw-1
+      - systemd
+      - pkexec | policykit-1

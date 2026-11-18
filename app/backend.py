@@ -88,11 +88,19 @@ def _quote_env(key: str, value: str) -> str:
     return f'"{escaped}"'
 
 
+def _is_elf(path: Path) -> bool:
+    try:
+        with open(path, "rb") as handle:
+            return handle.read(4) == b"\x7fELF"
+    except OSError:
+        return False
+
+
 def _python_for(path: Path) -> str:
     for base in (path.parent, path.parent.parent):
         for venv in _VENV_DIRS:
             candidate = base / venv / "bin" / "python"
-            if candidate.is_file():
+            if candidate.is_file() and _is_elf(candidate):
                 return str(candidate)
     return shutil.which("python3") or "/usr/bin/python3"
 
