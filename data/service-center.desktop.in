@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Service Center
+GenericName=Pengelola Layanan
+Comment=Daftarkan dan kelola program web sebagai layanan systemd
+Exec=@EXEC@
+Icon=service-center
+Terminal=false
+Categories=System;Settings;
+Keywords=service;systemd;daemon;layanan;server;
+StartupNotify=true
+StartupWMClass=io.github.hilalfajar.ServiceCenter
