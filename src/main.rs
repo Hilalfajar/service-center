@@ -1,4 +1,5 @@
 mod backend;
+mod cloudflare;
 mod db_restore;
 
 use backend::{Manager, ServiceState};
@@ -184,6 +185,7 @@ fn build_ui(app: &adw::Application) {
     menu_btn.set_icon_name("open-menu-symbolic");
     let menu = gio::Menu::new();
     menu.append(Some("Muat ulang"), Some("app.refresh"));
+    menu.append(Some("Cloudflare Tunnel…"), Some("win.cloudflare"));
     menu.append(Some("Tentang Service Center"), Some("app.about"));
     menu.append(Some("Keluar"), Some("app.quit"));
     menu_btn.set_menu_model(Some(&menu));
@@ -464,6 +466,19 @@ fn build_ui(app: &adw::Application) {
     };
     rebuild_rows();
     let rebuild_rows_rc = Rc::new(rebuild_rows);
+
+    // ---------------- Cloudflare Tunnel ----------------
+    {
+        let mgr = mgr.clone();
+        let toast = toast.clone();
+        let rebuild_rows = rebuild_rows_rc.clone();
+        let window_d = window.clone();
+        let action = gio::SimpleAction::new("cloudflare", None);
+        action.connect_activate(move |_, _| {
+            open_cloudflare_dialog(&window_d, &mgr, &toast, rebuild_rows.clone());
+        });
+        window.add_action(&action);
+    }
 
     // ---------------- Selection ----------------
     let detail_sel = detail.clone();
@@ -1257,6 +1272,315 @@ fn open_restore_dialog(
         page_top.scroll_to_top();
     });
 }
+
+fn open_cloudflare_dialog(
+    window: &adw::ApplicationWindow,
+    mgr: &Rc<RefCell<Manager>>,
+    toast: &adw::ToastOverlay,
+    rebuild_rows: Rc<dyn Fn()>,
+) {
+    let (config, config_path) = cloudflare::load();
+    let cloudflared = cloudflare::find_cloudflared();
+
+    let dialog = adw::Dialog::new();
+    dialog.set_content_width(620);
+    dialog.set_content_height(820);
+    dialog.set_title("Cloudflare Tunnel");
+
+    let toolbar = adw::ToolbarView::new();
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&adw::WindowTitle::new(
+        "Cloudflare Tunnel",
+        "Konfigurasi cloudflared",
+    )));
+    let cancel_btn = Button::with_label("Batal");
+    let dialog_c = dialog.clone();
+    cancel_btn.connect_clicked(move |_| {
+        dialog_c.close();
+    });
+    header.pack_start(&cancel_btn);
+    let save_btn = Button::with_label("Simpan");
+    save_btn.add_css_class("suggested-action");
+    header.pack_end(&save_btn);
+    toolbar.add_top_bar(&header);
+    dialog.set_child(Some(&toolbar));
+
+    let page = adw::PreferencesPage::new();
+    toolbar.set_content(Some(&page));
+
+    // ---- Tunnel ----
+    let tunnel_group = adw::PreferencesGroup::new();
+    tunnel_group.set_title("Tunnel");
+    tunnel_group.set_description(Some(
+        "Isi ID/nama tunnel dan file kredensial dari Cloudflare.",
+    ));
+    let tunnel_row = adw::EntryRow::new();
+    tunnel_row.set_title("Tunnel ID / nama");
+    tunnel_row.set_text(&config.tunnel);
+    let credentials_row = adw::EntryRow::new();
+    credentials_row.set_title("Credentials file");
+    credentials_row.set_text(&config.credentials_file);
+    tunnel_group.add(&tunnel_row);
+    tunnel_group.add(&credentials_row);
+
+    let credentials_pick = adw::ActionRow::new();
+    credentials_pick.set_title("Pilih file kredensial");
+    credentials_pick.set_subtitle("File .json dari Cloudflare (opsional)");
+    let credentials_btn = Button::with_label("Pilih File…");
+    credentials_btn.set_valign(Align::Center);
+    credentials_pick.add_suffix(&credentials_btn);
+    credentials_pick.set_activatable_widget(Some(&credentials_btn));
+    tunnel_group.add(&credentials_pick);
+
+    let config_row = adw::ActionRow::new();
+    config_row.set_title("Lokasi config");
+    config_row.set_subtitle(&config_path.to_string_lossy());
+    config_row.set_subtitle_selectable(true);
+    tunnel_group.add(&config_row);
+
+    let binary_row = adw::ActionRow::new();
+    binary_row.set_title("cloudflared");
+    match &cloudflared {
+        Some(p) => binary_row.set_subtitle(&p.to_string_lossy()),
+        None => binary_row.set_subtitle("Tidak ditemukan. Pasang cloudflared dulu."),
+    }
+    binary_row.set_subtitle_selectable(true);
+    tunnel_group.add(&binary_row);
+    page.add(&tunnel_group);
+
+    // ---- Ingress ----
+    let ingress_group = adw::PreferencesGroup::new();
+    ingress_group.set_title("Ingress");
+    ingress_group.set_description(Some(
+        "Satu per baris: hostname = service. Contoh: app.example.com = http://localhost:8080. Baris tanpa hostname menjadi catch-all.",
+    ));
+    let ingress_expander = adw::ExpanderRow::new();
+    ingress_expander.set_title("Aturan ingress");
+    ingress_expander.set_subtitle("hostname = service");
+    ingress_expander.set_expanded(true);
+    let ingress_scroller = ScrolledWindow::new();
+    ingress_scroller.set_min_content_height(160);
+    ingress_scroller.set_policy(gtk4::PolicyType::Never, gtk4::PolicyType::Automatic);
+    let ingress_view = TextView::new();
+    ingress_view.set_monospace(true);
+    ingress_view.set_left_margin(8);
+    ingress_view.set_right_margin(8);
+    ingress_view.set_top_margin(6);
+    ingress_view.set_bottom_margin(6);
+    ingress_view.buffer().set_text(&cloudflare::ingress_text(&config.ingress));
+    ingress_scroller.set_child(Some(&ingress_view));
+    ingress_expander.add_row(&ingress_scroller);
+    ingress_group.add(&ingress_expander);
+    page.add(&ingress_group);
+
+    // ---- Opsi ----
+    let option_group = adw::PreferencesGroup::new();
+    option_group.set_title("Opsi");
+    let autoupdate_row = adw::SwitchRow::new();
+    autoupdate_row.set_title("Nonaktifkan auto-update");
+    autoupdate_row.set_subtitle("Disarankan untuk layanan yang berjalan terus");
+    autoupdate_row.set_active(config.no_autoupdate);
+    let loglevel_row = adw::ComboRow::new();
+    loglevel_row.set_title("Level log");
+    let levels = ["info", "debug", "warn", "error"];
+    loglevel_row.set_model(Some(&gtk4::StringList::new(&levels)));
+    let level_idx = levels
+        .iter()
+        .position(|&l| l == config.loglevel.as_str())
+        .unwrap_or(0);
+    loglevel_row.set_selected(level_idx as u32);
+    let metrics_row = adw::EntryRow::new();
+    metrics_row.set_title("Metrics (opsional)");
+    metrics_row.set_text(&config.metrics);
+    option_group.add(&autoupdate_row);
+    option_group.add(&loglevel_row);
+    option_group.add(&metrics_row);
+    page.add(&option_group);
+
+    // ---- Daftarkan layanan ----
+    let service_group = adw::PreferencesGroup::new();
+    service_group.set_title("Layanan Service Center");
+    service_group.set_description(Some(
+        "Daftarkan cloudflared sebagai layanan systemd user agar otomatis jalan.",
+    ));
+    let register_row = adw::SwitchRow::new();
+    register_row.set_title("Daftarkan ke Service Center");
+    register_row.set_active(true);
+    let service_name_row = adw::EntryRow::new();
+    service_name_row.set_title("Nama layanan");
+    service_name_row.set_text("Cloudflare Tunnel");
+    let service_autostart_row = adw::SwitchRow::new();
+    service_autostart_row.set_title("Mulai otomatis saat boot");
+    service_autostart_row.set_active(true);
+    let service_start_row = adw::SwitchRow::new();
+    service_start_row.set_title("Jalankan sekarang");
+    service_start_row.set_active(true);
+    service_group.add(&register_row);
+    service_group.add(&service_name_row);
+    service_group.add(&service_autostart_row);
+    service_group.add(&service_start_row);
+    page.add(&service_group);
+
+    // ---- Pilih credentials ----
+    {
+        let credentials_row = credentials_row.clone();
+        let window_c = window.clone();
+        credentials_btn.connect_clicked(move |_| {
+            let credentials_row = credentials_row.clone();
+            pick_file_filtered(
+                &window_c,
+                "Pilih credentials file",
+                "JSON (*.json)",
+                &["*.json"],
+                move |path| {
+                    credentials_row.set_text(&path.to_string_lossy());
+                },
+            );
+        });
+    }
+
+    // ---- Simpan ----
+    {
+        let mgr = mgr.clone();
+        let toast = toast.clone();
+        let rebuild_rows = rebuild_rows.clone();
+        let dialog_c = dialog.clone();
+        let window_c = window.clone();
+        let config_path = config_path.clone();
+        let cloudflared = cloudflared.clone();
+        save_btn.connect_clicked(move |_| {
+            let show_error = |msg: &str| {
+                let alert = adw::AlertDialog::new(Some("Tidak bisa melanjutkan"), Some(msg));
+                alert.add_response("ok", "OK");
+                alert.present(Some(&window_c));
+            };
+            let tunnel = tunnel_row.text().trim().to_string();
+            if tunnel.is_empty() {
+                show_error("Tunnel ID / nama wajib diisi.");
+                return;
+            }
+            let credentials_file = credentials_row.text().trim().to_string();
+            if !credentials_file.is_empty()
+                && !std::path::Path::new(&credentials_file).is_file()
+            {
+                show_error("File kredensial tidak ditemukan.");
+                return;
+            }
+            let buf = ingress_view.buffer();
+            let ingress_text = buf
+                .text(&buf.start_iter(), &buf.end_iter(), false)
+                .to_string();
+            let ingress = cloudflare::parse_ingress(&ingress_text);
+            let idx = loglevel_row.selected() as usize;
+            let loglevel = levels.get(idx).copied().unwrap_or("info").to_string();
+            let cfg = cloudflare::CloudflareConfig {
+                tunnel,
+                credentials_file,
+                no_autoupdate: autoupdate_row.is_active(),
+                loglevel,
+                metrics: metrics_row.text().trim().to_string(),
+                ingress,
+            };
+            if let Err(e) = cloudflare::save(&cfg, &config_path) {
+                show_error(&format!("Gagal menulis config: {}", e));
+                return;
+            }
+
+            if register_row.is_active() {
+                let Some(binary) = cloudflared.clone() else {
+                    show_error("cloudflared tidak ditemukan. Pasang cloudflared dulu.");
+                    return;
+                };
+                let name = service_name_row.text().trim().to_string();
+                if name.is_empty() {
+                    show_error("Nama layanan wajib diisi.");
+                    return;
+                }
+                let command = cloudflare::service_command(&binary, &config_path);
+                let workdir = config_path
+                    .parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| {
+                        dirs::home_dir()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| "/".into())
+                    });
+                let existing = mgr
+                    .borrow()
+                    .services()
+                    .into_iter()
+                    .find(|s| s.file.ends_with("/cloudflared") || s.name == name);
+                match existing {
+                    Some(svc) => {
+                        let result = mgr.borrow_mut().update(
+                            &svc.id,
+                            &name,
+                            &binary.to_string_lossy(),
+                            command,
+                            &workdir,
+                            svc.env.clone(),
+                            "on-failure",
+                            service_autostart_row.is_active(),
+                            false,
+                        );
+                        match result {
+                            Ok((_svc, warnings)) => {
+                                if service_start_row.is_active() {
+                                    let _ = mgr
+                                        .borrow()
+                                        .set_enabled(&svc.id, service_autostart_row.is_active());
+                                    let _ = mgr.borrow().start(&svc.id);
+                                }
+                                if !warnings.is_empty() {
+                                    toast.add_toast(adw::Toast::new(&warnings.join("; ")));
+                                }
+                            }
+                            Err(e) => {
+                                show_error(&e);
+                                return;
+                            }
+                        }
+                    }
+                    None => {
+                        let result = mgr.borrow_mut().add(
+                            &name,
+                            &binary.to_string_lossy(),
+                            command,
+                            &workdir,
+                            std::collections::BTreeMap::new(),
+                            "on-failure",
+                            service_autostart_row.is_active(),
+                            service_start_row.is_active(),
+                        );
+                        match result {
+                            Ok((_svc, warnings)) => {
+                                if !warnings.is_empty() {
+                                    toast.add_toast(adw::Toast::new(&warnings.join("; ")));
+                                }
+                            }
+                            Err(e) => {
+                                show_error(&e);
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+
+            dialog_c.close();
+            rebuild_rows();
+            do_refresh();
+            toast.add_toast(adw::Toast::new("Config Cloudflare disimpan"));
+        });
+    }
+
+    dialog.present(Some(window));
+    let page_top = page.clone();
+    adw::glib::timeout_add_local_once(std::time::Duration::from_millis(400), move || {
+        page_top.scroll_to_top();
+    });
+}
+
 
 fn open_add_dialog(
     window: &adw::ApplicationWindow,
