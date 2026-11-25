@@ -66,14 +66,16 @@ cd service-center
 ## Cloudflare Tunnel
 
 1. Buka menu **≡ → Cloudflare Tunnel…**
-2. Isi Tunnel ID/nama dan pilih file credentials `.json`.
-3. Isi ingress, satu baris per hostname:
+2. Jika `cloudflared` belum tersedia, klik **Unduh** untuk memasang binary resmi
+   Linux x86_64/ARM64 ke `~/.local/bin` (memerlukan `curl`).
+3. Isi Tunnel ID/nama dan pilih file credentials `.json`.
+4. Isi ingress, satu baris per hostname:
 
    ```text
    app.example.com = http://localhost:8080
    ```
 
-4. Simpan. Aplikasi menulis `~/.cloudflared/config.yaml` dan mendaftarkan
+5. Simpan. Aplikasi menulis `~/.cloudflared/config.yaml` dan mendaftarkan
    `cloudflared` sebagai layanan Service Center.
 
 DNS record tetap harus dibuat terpisah, lewat dashboard (Zero Trust → Tunnels →
@@ -85,6 +87,10 @@ cloudflared tunnel route dns <tunnel> app.example.com
 
 Ingress di `config.yaml` hanya mengatur routing; tanpa DNS record, hostname
 tidak akan resolve.
+
+Layanan yang sudah didaftarkan dapat dipilih dari sidebar lalu diedit lewat
+tombol **Edit**. Perubahan command dan pengaturan layanan ditulis ke unit
+systemd milik Service Center; aplikasi tidak mengedit unit systemd lain.
 
 ## Restore database
 
