@@ -1280,7 +1280,7 @@ fn open_cloudflare_dialog(
     rebuild_rows: Rc<dyn Fn()>,
 ) {
     let (config, config_path) = cloudflare::load();
-    let cloudflared = cloudflare::find_cloudflared();
+    let cloudflared = Rc::new(RefCell::new(cloudflare::find_cloudflared()));
 
     let dialog = adw::Dialog::new();
     dialog.set_content_width(620);
@@ -1340,11 +1340,15 @@ fn open_cloudflare_dialog(
 
     let binary_row = adw::ActionRow::new();
     binary_row.set_title("cloudflared");
-    match &cloudflared {
+    match cloudflared.borrow().as_ref() {
         Some(p) => binary_row.set_subtitle(&p.to_string_lossy()),
-        None => binary_row.set_subtitle("Tidak ditemukan. Pasang cloudflared dulu."),
+        None => binary_row.set_subtitle("Belum terpasang. Unduh binary resmi Linux."),
     }
     binary_row.set_subtitle_selectable(true);
+    let download_btn = Button::with_label("Unduh");
+    download_btn.set_valign(Align::Center);
+    download_btn.set_visible(cloudflared.borrow().is_none());
+    binary_row.add_suffix(&download_btn);
     tunnel_group.add(&binary_row);
     page.add(&tunnel_group);
 
@@ -1421,6 +1425,55 @@ fn open_cloudflare_dialog(
     service_group.add(&service_start_row);
     page.add(&service_group);
 
+    // ---- Unduh cloudflared ----
+    {
+        let cloudflared = cloudflared.clone();
+        let binary_row = binary_row.clone();
+        let download_btn = download_btn.clone();
+        let button = download_btn.clone();
+        let toast = toast.clone();
+        let window = window.clone();
+        download_btn.connect_clicked(move |_| {
+            button.set_sensitive(false);
+            binary_row.set_subtitle("Mengunduh dan memverifikasi binary resmi…");
+
+            let result = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let result_worker = result.clone();
+            std::thread::spawn(move || {
+                *result_worker.lock().unwrap() = Some(cloudflare::install_cloudflared());
+            });
+
+            let result_poll = result.clone();
+            let cloudflared = cloudflared.clone();
+            let binary_row = binary_row.clone();
+            let download_btn = button.clone();
+            let toast = toast.clone();
+            let window = window.clone();
+            adw::glib::timeout_add_local(std::time::Duration::from_millis(120), move || {
+                let Some(result) = result_poll.lock().unwrap().take() else {
+                    return adw::glib::ControlFlow::Continue;
+                };
+                match result {
+                    Ok(path) => {
+                        binary_row.set_subtitle(&path.to_string_lossy());
+                        download_btn.set_visible(false);
+                        *cloudflared.borrow_mut() = Some(path);
+                        toast.add_toast(adw::Toast::new("cloudflared berhasil diunduh"));
+                    }
+                    Err(error) => {
+                        binary_row.set_subtitle("Unduhan gagal. Coba lagi atau pasang manual.");
+                        download_btn.set_sensitive(true);
+                        let alert =
+                            adw::AlertDialog::new(Some("Gagal memasang cloudflared"), Some(&error));
+                        alert.add_response("ok", "OK");
+                        alert.present(Some(&window));
+                    }
+                }
+                adw::glib::ControlFlow::Break
+            });
+        });
+    }
+
     // ---- Pilih credentials ----
     {
         let credentials_row = credentials_row.clone();
@@ -1481,16 +1534,23 @@ fn open_cloudflare_dialog(
                 metrics: metrics_row.text().trim().to_string(),
                 ingress,
             };
+            let binary = if register_row.is_active() {
+                match cloudflared.borrow().clone() {
+                    Some(binary) => Some(binary),
+                    None => {
+                        show_error("Unduh cloudflared terlebih dahulu sebelum mendaftarkan layanan.");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             if let Err(e) = cloudflare::save(&cfg, &config_path) {
                 show_error(&format!("Gagal menulis config: {}", e));
                 return;
             }
 
-            if register_row.is_active() {
-                let Some(binary) = cloudflared.clone() else {
-                    show_error("cloudflared tidak ditemukan. Pasang cloudflared dulu.");
-                    return;
-                };
+            if let Some(binary) = binary {
                 let name = service_name_row.text().trim().to_string();
                 if name.is_empty() {
                     show_error("Nama layanan wajib diisi.");

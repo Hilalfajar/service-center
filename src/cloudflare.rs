@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CloudflareConfig {
@@ -65,6 +66,120 @@ pub fn find_cloudflared() -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn download_url_for_arch(arch: &str) -> Result<&'static str, String> {
+    match arch {
+        "x86_64" => Ok(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+        ),
+        "aarch64" => Ok(
+            "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64",
+        ),
+        _ => Err(format!(
+            "Unduhan otomatis cloudflared belum mendukung arsitektur {}",
+            arch
+        )),
+    }
+}
+
+pub fn install_cloudflared() -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let url = download_url_for_arch(std::env::consts::ARCH)?;
+    let bin_dir = home().join(".local/bin");
+    fs::create_dir_all(&bin_dir).map_err(|e| format!("Gagal membuat direktori bin: {}", e))?;
+
+    let destination = bin_dir.join("cloudflared");
+    if destination.exists() {
+        return Err(format!(
+            "File {} sudah ada; pindahkan atau hapus dahulu sebelum memasang",
+            destination.display()
+        ));
+    }
+
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("Jam sistem tidak valid: {}", e))?
+        .as_nanos();
+    let temporary = bin_dir.join(format!(
+        ".cloudflared-{}-{}.download",
+        std::process::id(),
+        nonce
+    ));
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|e| format!("Gagal membuat file sementara unduhan: {}", e))?;
+    let download = match Command::new("curl")
+        .args([
+            "--fail",
+            "--location",
+            "--silent",
+            "--show-error",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "300",
+            "--output",
+        ])
+        .arg(&temporary)
+        .arg(url)
+        .output()
+    {
+        Ok(output) => output,
+        Err(e) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!(
+                "Gagal menjalankan curl (pastikan curl terpasang): {}",
+                e
+            ));
+        }
+    };
+    if !download.status.success() {
+        let _ = fs::remove_file(&temporary);
+        let detail = String::from_utf8_lossy(&download.stderr).trim().to_string();
+        return Err(if detail.is_empty() {
+            "Unduhan cloudflared gagal".into()
+        } else {
+            format!("Unduhan cloudflared gagal: {}", detail)
+        });
+    }
+
+    if let Err(e) = fs::set_permissions(&temporary, fs::Permissions::from_mode(0o755)) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Gagal mengatur izin binary: {}", e));
+    }
+    let check = Command::new(&temporary).arg("--version").output();
+    match check {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            let _ = fs::remove_file(&temporary);
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if detail.is_empty() {
+                "Binary cloudflared yang diunduh tidak dapat dijalankan".into()
+            } else {
+                format!("Binary cloudflared tidak valid: {}", detail)
+            });
+        }
+        Err(e) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(format!("Gagal memverifikasi binary cloudflared: {}", e));
+        }
+    }
+
+    if let Err(e) = fs::hard_link(&temporary, &destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(format!("Gagal memasang cloudflared: {}", e));
+    }
+    fs::remove_file(&temporary).map_err(|e| {
+        format!(
+            "cloudflared terpasang, tetapi file sementara gagal dihapus: {}",
+            e
+        )
+    })?;
+    Ok(destination)
 }
 
 pub fn load() -> (CloudflareConfig, PathBuf) {
@@ -156,6 +271,17 @@ pub fn service_command(cloudflared: &PathBuf, config_path: &PathBuf) -> Vec<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_url_supports_common_linux_architectures() {
+        assert!(download_url_for_arch("x86_64")
+            .unwrap()
+            .ends_with("cloudflared-linux-amd64"));
+        assert!(download_url_for_arch("aarch64")
+            .unwrap()
+            .ends_with("cloudflared-linux-arm64"));
+        assert!(download_url_for_arch("riscv64").is_err());
+    }
 
     #[test]
     fn parse_ingress_lines() {
